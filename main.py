@@ -1,11 +1,11 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import os
+import time, random, os, asyncio
 
 app = FastAPI()
 
-# ✅ Enable CORS (open for testing)
+# --- Enable CORS ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -13,55 +13,64 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.get("/")
-async def root():
-    return {"message": "Chat backend is running."}
-
-# 📁 File & Data Storage
+# --- Data storage ---
 DATA_FILE = "data.txt"
-user_passwords = {}
-chat_history = []  # Stores (username, type, content)
+user_passwords: dict[str, str] = {}              # username -> password
+user_memo: dict[str, dict[str, str]] = {}        # username -> {key: value}
 
-MAX_MESSAGES = 500  # Only keep last 500 messages in memory and file
-
-# ✅ Load existing data
+# --- Load everything on startup ---
 if os.path.exists(DATA_FILE):
     with open(DATA_FILE, "r") as f:
-        for line in f:
-            parts = line.strip().split(" ", 3)
+        for raw in f:
+            parts = raw.rstrip("\n").split(" ", 3)
             if not parts:
                 continue
-            if parts[0] == "U" and len(parts) == 3:
+            tag = parts[0]
+            if tag == "U" and len(parts) == 3:
                 user_passwords[parts[1]] = parts[2]
-            elif parts[0] == "C" and len(parts) == 4:
-                chat_history.append((parts[1], parts[2], parts[3]))
+            elif tag == "M" and len(parts) == 4:
+                user_memo.setdefault(parts[1], {})[parts[2]] = parts[3]
 
-# ⛔ Trim to last MAX_MESSAGES
-if len(chat_history) > MAX_MESSAGES:
-    chat_history = chat_history[-MAX_MESSAGES:]
+# --- Append helper ---
+def record(line: str) -> None:
+    with open(DATA_FILE, "a") as f:
+        f.write(line)
 
-# 💾 Save everything back to file
-def save_data():
-    with open(DATA_FILE, "w") as f:
-        for u, p in user_passwords.items():
-            f.write(f"U {u} {p}\n")
-        for u, t, c in chat_history[-MAX_MESSAGES:]:  # Always trim to last 500
-            f.write(f"C {u} {t} {c}\n")
+# --- Simple pseudo-hash ---
+def crypt(s: str) -> str:
+    seed = time.time() + random.random()
+    res = 0
+    for c in s:
+        res = ord(c) + (res << 4) + (res << 10) - res + (ord(c) ^ res) + int(seed)
+    return str(res)
 
-# 🛠️ Request schema
+# --- Heartbeat to keep app alive ---
+@app.on_event("startup")
+async def keep_alive():
+    async def heartbeat():
+        while True:
+            await asyncio.sleep(45)
+            _ = os.path.exists(DATA_FILE)  # Do something trivial
+            print("[Heartbeat] App is still running.")
+    asyncio.create_task(heartbeat())
+
+# --- Root route ---
+@app.get("/")
+async def root():
+    return {"message": "Backend is running"}
+
+# --- Request schema ---
 class UserInput(BaseModel):
     action: str
     username: str
     password: str = ""
-    msg_type: str = ""   # text, image, video
-    content: str = ""    # message body or media URL
+    key: str = ""
+    value: str = ""
 
+# --- Main POST handler ---
 @app.post("/")
 async def handle(req: UserInput):
-    u = req.username.strip()
-    p = req.password.strip()
-    t = req.msg_type.strip()
-    c = req.content.strip()
+    u, p, k, v = req.username.strip(), req.password.strip(), req.key.strip(), req.value.strip()
 
     if req.action == "register":
         if not u or not p:
@@ -69,7 +78,8 @@ async def handle(req: UserInput):
         if u in user_passwords:
             return {"success": False, "exists": True, "message": f"User '{u}' already exists."}
         user_passwords[u] = p
-        save_data()
+        user_memo[u] = {}
+        record(f"U {u} {p}\n")
         return {"success": True, "message": f"User '{u}' registered successfully."}
 
     if req.action == "login":
@@ -77,26 +87,30 @@ async def handle(req: UserInput):
             return {"success": True, "message": f"Welcome, {u}!"}
         return {"success": False, "message": "Incorrect username or password."}
 
-    if req.action == "send":
-        if u not in user_passwords:
-            return {"success": False, "message": "User not registered."}
-        if t not in ["text", "image", "video"]:
-            return {"success": False, "message": "Invalid message type."}
-        if not c:
-            return {"success": False, "message": "Empty message."}
-        chat_history.append((u, t, c))
-        if len(chat_history) > MAX_MESSAGES:
-            chat_history.pop(0)  # Keep only latest messages
-        save_data()
-        return {"success": True, "message": "Message sent."}
+    if req.action == "save":
+        if k in user_memo.get(u, {}):
+            return {"success": False, "message": f"The key '{k}' already exists."}
+        h = crypt(k)
+        user_memo.setdefault(u, {})[k] = h
+        user_memo[u][h] = k
+        record(f"M {u} {k} {h}\n")
+        record(f"M {u} {h} {k}\n")
+        return {"success": True, "message": f"Key '{k}' saved."}
 
-    if req.action == "get":
-        return {
-            "success": True,
-            "messages": [
-                {"username": user, "type": msg_type, "content": content}
-                for user, msg_type, content in chat_history
-            ]
-        }
+    if req.action == "renew":
+        if k not in user_memo.get(u, {}):
+            return {"success": False, "message": f"Key '{k}' not found."}
+        h = crypt(k)
+        user_memo[u][k] = h
+        user_memo[u][h] = k
+        record(f"M {u} {k} {h}\n")
+        record(f"M {u} {h} {k}\n")
+        return {"success": True, "message": f"Key '{k}' renewed."}
+
+    if req.action == "give":
+        val = user_memo.get(u, {}).get(v)
+        if val:
+            return {"success": True, "result": val}
+        return {"success": False, "message": f"No value found for key '{v}'."}
 
     return {"success": False, "message": "Unknown action."}
