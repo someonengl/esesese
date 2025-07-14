@@ -5,7 +5,7 @@ import time, random, os, asyncio
 
 app = FastAPI()
 
-# --- Enable CORS ---
+# --- Enable CORS --
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
